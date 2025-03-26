@@ -6,17 +6,23 @@
 We use Firestore transactions to ensure accurate stock management:
 
 ```python
+@firestore.transactional
 def process_order(transaction):
-    # Check stock
+    product_ref = db.collection("Products").document(product_id)
     product = product_ref.get(transaction=transaction)
-    quantity = product_data["quantity"]
+    if not product.exists:
+        raise HTTPException(status_code=404, detail="Product not found")
     
-    # Update if available
-    if quantity > 0:
-        transaction.update(product_ref, {"quantity": quantity - 1})
-        transaction.set(orders_ref, order_data)
-    else:
-        raise HTTPException(status_code=400, detail="Out of stock")
+    product_data = product.to_dict()
+    quantity = int(product_data["quantity"])
+    if product_data["status"] != "in_stock" or quantity <= 0:
+        raise HTTPException(status_code=400, detail="Product out of stock")
+
+    new_quantity = quantity - 1
+    transaction.update(product_ref, {"quantity": new_quantity})
+
+    if new_quantity == 0:
+        transaction.update(product_ref, {"status": "out_of_stock"})
 ```
 
 This ensures:
@@ -26,20 +32,26 @@ This ensures:
 - Concurrent orders are handled safely
 
 ### Firestore Transaction Failures
-We implement a simple retry mechanism:
+We implement a retry mechanism:
 
 ```python
-# Attempt the transaction up to 3 times
-for _ in range(3):
+retry_count = 0
+while retry_count < MAX_TRANSACTION_RETRIES:
     try:
-        process_order(transaction)
-        return "Order placed successfully"
+        transaction = db.transaction()
+        product_name = process_order(transaction)
+        background_tasks.add_task(send_confirmation_email, buyer_email, product_name)
+        return {"message": f"Order placed for {product_name}"}
+        
+    except firestore.exceptions.TransactionError:
+        retry_count += 1
+        if retry_count >= MAX_TRANSACTION_RETRIES:
+            raise HTTPException(
+                status_code=503,
+                detail="Transaction failed after maximum retries"
+            )
     except Exception as e:
-        if "out of stock" in str(e):
-            return "Product out of stock"
-        continue
-
-return "Transaction failed, please try again"
+        raise HTTPException(status_code=400, detail=str(e))
 ```
 
 This provides:
@@ -51,7 +63,23 @@ This provides:
 ### Background Task Considerations
 Currently implemented for email notifications:
 ```python
-background_tasks.add_task(send_email, buyer_email, product_name)
+def send_confirmation_email(email: str, product_name: str):
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = SMTP_USERNAME
+        msg['To'] = email
+        msg['Subject'] = f"New order for product {product_name}"
+        
+        body = f"Thank you for your order of {product_name}!"
+        msg.attach(MIMEText(body, 'plain'))
+        
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(msg)
+            
+    except Exception as e:
+        print(f"Failed to send email: {str(e)}")
 ```
 
 Potential issues:
