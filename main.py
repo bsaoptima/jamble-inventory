@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status
 from google.cloud import firestore, secretmanager
-from google.cloud.firestore_v1 import Transaction
+from google.cloud.firestore_v1.transaction import Transaction
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import os
+from functools import wraps
 
 #Auth setup & functions
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -34,14 +35,16 @@ fake_users_db = {
 }
 
 #Secret manager fetch
-def get_secret(secret_id: str) -> str:
-    client = secretmanager.SecretManagerServiceClient()
+async def get_secret(secret_id: str) -> str:
+    client = secretmanager.SecretManagerServiceAsyncClient() #make it async
     name = f"projects/jamble-test-454718/secrets/{secret_id}/versions/latest"
-    response = client.access_secret_version(request={"name": name})
+    response = await client.access_secret_version(request={"name": name})
     return response.payload.data.decode("UTF-8")
 
-SECRET_KEY = get_secret("JWT_SECRET_KEY")
-SMTP_PASSWORD = get_secret("SMTP_PASSWORD")
+
+
+SECRET_KEY = None
+SMTP_PASSWORD = None
 ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 30))
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
@@ -49,31 +52,21 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
 SMTP_USERNAME = os.getenv("SMTP_USERNAME", "bogdanstefan.agrici@gmail.com")
 MAX_TRANSACTION_RETRIES = int(os.getenv("MAX_TRANSACTION_RETRIES", 3))
 
-def send_confirmation_email(email: str, product_name: str):
+
+async def send_confirmation_email(email: str, product_name: str):
     #this function won't actually send an email, but it will print the email address and product name
-    try:
-        msg = MIMEMultipart()
-        msg['From'] = SMTP_USERNAME
-        msg['To'] = email
-        msg['Subject'] = f"New order for product {product_name}"
-        
-        body = f"Thank you for your order of {product_name}!"
-        msg.attach(MIMEText(body, 'plain'))
-        
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USERNAME, SMTP_PASSWORD)
-            server.send_message(msg)
-            
-    except Exception as e:
-        print(f"Failed to send email: {str(e)}")
-
-
+    print("email sent to ", email, "for product ", product_name)
 
 """ API endpoints """
 
 app = FastAPI()
-db = firestore.Client(project="jamble-test-454718")
+db = firestore.AsyncClient(project="jamble-test-454718")
+
+@app.on_event("startup")
+async def startup():
+    global SECRET_KEY, SMTP_PASSWORD
+    SECRET_KEY = await get_secret("JWT_SECRET_KEY")
+    SMTP_PASSWORD = await get_secret("SMTP_PASSWORD")
 
 @app.get("/")
 async def home():
@@ -105,7 +98,20 @@ class OrderRequest(BaseModel):
     buyer_email: str
     product_id: str
 
+def verify_token_email(func):
+    @wraps(func)
+    async def wrapper(order_data: OrderRequest, *args, token: str = Depends(oauth2_scheme), **kwargs):
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            if payload.get("sub") != order_data.buyer_email:
+                raise HTTPException(status_code=403, detail="Email mismatch")
+            return await func(order_data=order_data, token=token, *args, **kwargs)
+        except JWTError:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+    return wrapper
+
 @app.post("/place_order")
+@verify_token_email
 async def place_order(
     order_data: OrderRequest,
     background_tasks: BackgroundTasks,
@@ -113,18 +119,13 @@ async def place_order(
 ):
     buyer_email = order_data.buyer_email
     product_id = order_data.product_id
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        if payload.get("sub") != buyer_email:
-            raise HTTPException(status_code=403, detail="Email mismatch")
-        
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
     
-    @firestore.transactional
-    def process_order(transaction):
-        product_ref = db.collection("Products").document(product_id)
-        product = product_ref.get(transaction=transaction)
+    transaction = db.transaction()
+    product_ref = db.collection("Products").document(product_id)
+
+    @firestore.async_transactional
+    async def update_in_transaction(transaction: Transaction, product_ref):
+        product = await product_ref.get(transaction=transaction)
         if not product.exists:
             raise HTTPException(status_code=404, detail="Product not found")
         
@@ -145,27 +146,24 @@ async def place_order(
             "product_id": product_id,
         }
         
-        #create the order in transaction
         orders_ref = db.collection("Orders").document()
         transaction.set(orders_ref, order_data)
 
         return product_data["product_name"]
     
-    #handle transaction errors and retries
     retry_count = 0
     while retry_count < MAX_TRANSACTION_RETRIES:
         try:
-            transaction = db.transaction()
-            product_name = process_order(transaction)
+            product_name = await update_in_transaction(transaction, product_ref)
             background_tasks.add_task(send_confirmation_email, buyer_email, product_name)
             return {"message": f"Order placed for {product_name}"}
             
-        except firestore.exceptions.TransactionError:
+        except Exception as e:
             retry_count += 1
             if retry_count >= MAX_TRANSACTION_RETRIES:
                 raise HTTPException(
                     status_code=503,
-                    detail="Transaction failed after maximum retries"
+                    detail=f"Transaction failed after {MAX_TRANSACTION_RETRIES} retries: {str(e)}"
                 )
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            transaction = db.transaction()
+            continue
