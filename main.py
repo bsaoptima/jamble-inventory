@@ -155,8 +155,7 @@ async def place_order(
     while retry_count < MAX_TRANSACTION_RETRIES:
         try:
             product_name = await update_in_transaction(transaction, product_ref)
-            background_tasks.add_task(send_confirmation_email, buyer_email, product_name)
-            return {"message": f"Order placed for {product_name}"}
+            break
             
         except Exception as e:
             retry_count += 1
@@ -167,3 +166,10 @@ async def place_order(
                 )
             transaction = db.transaction()
             continue
+    
+    try:
+        background_tasks.add_task(send_confirmation_email, buyer_email, product_name)
+    except Exception as e:
+        print(f"Failed to queue confirmation email: {str(e)}")
+    
+    return {"message": f"Order placed for {product_name}"}
